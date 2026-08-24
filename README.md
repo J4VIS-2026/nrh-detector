@@ -29,8 +29,10 @@
 npm 에 올리지 않았습니다. **받은 배포 파일(`.tgz`)을 경로로 설치하세요.**
 
 ```bash
-npm install ./nrh-detector-0.10.1.tgz    # 파일 이름의 판 번호는 받은 것에 맞추세요
+npm install ./nrh-detector-0.10.1.tgz    # 파일 이름의 버전은 받은 것에 맞추세요
 ```
+
+배포 파일을 직접 만들려면 아래 **직접 빌드하고 시험하기**를 보세요.
 
 런타임은 **대상에 맞는 것을 직접 넣습니다.** 하나로 둘을 덮을 수 없어서 그렇습니다 —
 패키지가 다르고 버전도 다릅니다.
@@ -525,10 +527,16 @@ node demo/server.mjs                             # 저장소를 받아 빌드한
 npm install
 npm run build      # TypeScript → dist/
 npm test
+npm pack           # → nrh-detector-0.10.1.tgz (배포 파일)
 ```
 
 **모델을 저장소 최상위에 `model.onnx`로 두면** 테스트가 전부 돕니다. 없으면 모델이
 필요한 것만 건너뜁니다 — `skipped`가 0인지 보세요.
+
+**`npm pack` 은 빌드를 하지 않습니다.** `dist/` 를 그대로 묶기만 하므로 **반드시
+`npm run build` 를 먼저 하세요.** 안 그러면 낡은 `dist/` 가 그대로 나갑니다.
+
+만들어진 `.tgz` 는 `.gitignore` 로 막혀 있어 저장소에는 안 올라갑니다.
 
 ---
 
