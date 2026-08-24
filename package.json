@@ -1,0 +1,46 @@
+{
+  "name": "nrh-detector",
+  "version": "0.10.1",
+  "description": "보행 장애물 탐지와 추적 - 브라우저와 React Native 에서 도는 경량 모듈",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "exports": {
+    ".": "./dist/core/index.js",
+    "./web": "./dist/web/index.js",
+    "./native": "./dist/native/index.js"
+  },
+  "files": [
+    "dist",
+    "demo",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test \"test/*.test.js\"",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "check:names": "node tools/scan-korean.cjs"
+  },
+  "peerDependencies": {
+    "onnxruntime-react-native": ">=1.24.3",
+    "onnxruntime-web": ">=1.27.0"
+  },
+  "peerDependenciesMeta": {
+    "onnxruntime-web": {
+      "optional": true
+    },
+    "onnxruntime-react-native": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "onnxruntime-react-native": "^1.24.3",
+    "onnxruntime-web": "^1.29.0",
+    "react-native-fast-opencv": "^1.0.1",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "nrh-detector": "file:nrh-detector-0.10.1.tgz"
+  }
+}
