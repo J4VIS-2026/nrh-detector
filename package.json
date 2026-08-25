@@ -36,11 +36,8 @@
   },
   "devDependencies": {
     "onnxruntime-react-native": "^1.24.3",
-    "onnxruntime-web": "^1.29.0",
+    "onnxruntime-web": "^1.27.0",
     "react-native-fast-opencv": "^1.0.1",
     "typescript": "^5.7.0"
-  },
-  "dependencies": {
-    "nrh-detector": "file:nrh-detector-0.10.1.tgz"
   }
 }
