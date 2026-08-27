@@ -1,0 +1,428 @@
+<meta charset="utf-8">
+<title>실시간 탐지 (브라우저)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; background: #0b0d12; color: #e8ecf4; }
+  header { padding: 10px 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+           border-bottom: 1px solid #232838; }
+  button, select { font: inherit; padding: 6px 12px; border-radius: 7px; border: 0;
+                   background: #2563eb; color: #fff; font-weight: 700; cursor: pointer; }
+  button.off { background: #475569; }
+  button:disabled { opacity: .45; cursor: default; }
+  /*
+   * **긴 변이 화면에 맞게 한다.** 폭만 맞추면 세로 영상은 아래가 잘려 안 보인다 -
+   * 360×640을 폭 1280에 맞추면 높이가 2276이 된다.
+   *
+   * `무대`가 영상 크기만큼만 차지하게 두고(inline-block), 영상에 `max-height`를 건다.
+   * 캔버스는 그 위에 100%로 덮으므로 자동으로 같은 크기가 된다.
+   */
+  #stage-wrap { text-align: center; }
+  #stage { position: relative; display: inline-block; max-width: 100%; }
+  #stage video { display: block; max-width: 100%; max-height: calc(100vh - 260px);
+                width: auto; height: auto; }
+  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #stats { padding: 8px 14px; font-variant-numeric: tabular-nums; color: #9fb0c8; white-space: pre-wrap; }
+  b { color: #7dd3fc; }
+  #settings { display: flex; gap: 18px; flex-wrap: wrap; padding: 8px 14px;
+            border-bottom: 1px solid #232838; background: #10131a; }
+  #settings label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  #settings input { width: 16px; height: 16px; accent-color: #2563eb; cursor: pointer; }
+  .hint { color: #6b7a90; font-size: 12px; }
+</style>
+
+<header>
+  <button id="webcam">웹캠으로</button>
+  <select id="video-pick">
+    <option value="">— 샘플 영상 —</option>
+  </select>
+  <input type="file" id="file" accept="video/*" style="display:none">
+  <button id="file-btn">내 영상 열기</button>
+  <button id="reset">추적 ID 초기화</button>
+  <select id="resolution">
+    <option value="640x480">웹캠 640x480</option>
+    <option value="1280x720" selected>웹캠 1280x720</option>
+    <option value="1920x1080">웹캠 1920x1080</option>
+    <option value="0x0">웹캠 최대</option>
+  </select>
+  <span id="status">모델 여는 중...</span>
+</header>
+
+<!--
+  **단추가 아니라 체크박스다.** 단추에 상태를 적으면 그 글자가 지금 상태인지 누르면
+  될 일인지 헷갈린다 - 실제로 그렇게 헷갈렸다. 체크박스는 켜짐/꺼짐이 눈에 보인다.
+-->
+<div id="settings">
+  <label><input type="checkbox" id="fit" checked> 박스에 맞춰 화면 멈춤
+    <span class="hint">끄면 영상이 부드러운 대신 박스가 한 박자 늦습니다</span></label>
+  <label><input type="checkbox" id="gmc" checked> 흔들림 보정
+    <span class="hint">손에 들고 찍은 영상에서 트랙이 덜 끊깁니다</span></label>
+  <label><input type="checkbox" id="instant"> 첫 탐지부터 ID 붙이기
+    <span class="hint">켜면 ID가 빨리 붙는 대신 흔들리는 탐지마다 새 번호가 납니다</span></label>
+</div>
+
+<div id="stage-wrap">
+  <div id="stage">
+    <video id="video" playsinline muted loop></video>
+    <canvas id="overlay"></canvas>
+  </div>
+</div>
+<div id="stats"></div>
+
+<script type="importmap">
+{ "imports": { "onnxruntime-web": "/ort/ort.all.bundle.min.mjs" } }
+</script>
+<script type="module">
+import { Detector, Tracker, createGmc } from '/dist/web/index.js';
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const g = overlay.getContext('2d');
+const statusEl = document.getElementById('status');
+const statsEl = document.getElementById('stats');
+
+// 실제 파일이 어디 있는지는 `server.mjs`가 정한다 - 거기 표를 볼 것.
+// 짧게: `node`를 실행한 경로에 `model.onnx`를 두거나 `NRH_MODEL`로 가리킨다
+const MODEL = '/model.onnx';
+let det = null;
+let tracker = null;
+let gmcOn = true;
+/**
+ * 첫 탐지부터 ID를 붙일지. **기본은 끔이다.**
+ *
+ * 켜면 ID 붙은 비율은 100%로 보이는데 흔들리는 탐지마다 새 ID를 줘서 트랙이 두 배로
+ * 쪼개진다 - 화면에서는 작은 물체의 번호가 계속 바뀐다. 초당 3~4장까지 떨어지는
+ * 기기에서 특히 그렇다.
+ */
+let instantId = false;
+let looping = false;
+/**
+ * 박스에 맞춘 장면을 띄울지. **기본은 켬이다.**
+ *
+ * 끄면 영상이 부드러운 대신 **박스가 한 박자 늦는다** - 추론이 165ms 걸리는 동안
+ * 영상은 계속 흐르기 때문이다. 켜면 화면이 탐지 속도(초당 7장)로 끊기는 대신 박스가
+ * 정확히 맞는다. **탐지가 맞는지 보여주는 것이 이 페이지의 일이라 맞는 쪽을 기본으로 둔다.**
+ *
+ * 진짜 값은 화면의 체크 상태다(`readSettings`). 여기 값은 그전까지의 초기값일 뿐이다.
+ */
+let fitToBoxes = true;
+let grabbed = null;
+
+/**
+ * 라벨 글씨 크기. **화면에서 보이는 픽셀이지 캔버스 픽셀이 아니다.**
+ *
+ * 캔버스는 CSS로 늘어나고 줄어들므로, 이 값을 그 배율로 나눠서 그려야 해상도가 달라도
+ * 같은 크기로 보인다.
+ */
+const LABEL_PX = 12;
+
+/** 트랙 ID로 색을 정한다. 순서로 정하면 같은 물체가 매 프레임 색이 바뀐다. */
+function colorOf(id, classId, idx) {
+  const seed = id !== null && id !== undefined ? id * 97 : classId * 47 + idx;
+  return `hsl(${(seed * 47) % 360}, 85%, 60%)`;
+}
+
+function newTracker() {
+  tracker = new Tracker({ confirm_immediately: instantId }, gmcOn ? createGmc() : undefined);
+}
+
+async function start() {
+  readSettings();
+  det = await Detector.open({ modelUrl: MODEL });
+  newTracker();
+  statusEl.textContent = `준비됨 · 클래스 ${det.classNames.size}개`;
+
+  // `?video=영상3.mp4` 로 열면 고르지 않아도 바로 튼다. 확인용이자, 시연 때
+  // 주소만 눌러 시작하고 싶을 때 쓴다
+  // `?video=내영상.mp4` 는 클립 폴더, `?video=/videos/영상3.mp4` 처럼 경로를 줘도 된다
+  const wanted = new URLSearchParams(location.search).get('video');
+  if (wanted) {
+    play(wanted.startsWith('/') ? wanted.split('/').map(encodeURIComponent).join('/').replace(/%2F/g, '/')
+                               : '/clips/' + encodeURIComponent(wanted));
+  }
+
+  // **목록은 곁다리다. `await`로 막으면 안 된다.** 여기를 재생보다 앞에 두고
+  // 기다렸더니, 목록이 안 오는 동안 영상이 아예 안 틀어졌다
+  fetch('/videolist')
+    .then((r) => r.json())
+    .then((list) => {
+      const sel = document.getElementById('video-pick');
+      // **비어 있으면 비어 있다고 말한다.** 그냥 두면 받는 사람이 고장인 줄 안다 -
+      // 저장소에는 샘플이 안 들어가므로 대부분 이 경우다
+      if (list.length === 0) {
+        sel.options[0].textContent = '— 샘플 영상 없음 (웹캠이나 「내 영상 열기」를 쓰세요) —';
+        return;
+      }
+      for (const urlPath of list) {
+        const o = document.createElement('option');
+        // 서버가 `/clips/내영상.mp4` 처럼 경로째 준다. 한글 파일명이 섞이므로 조각마다 인코딩한다
+        o.value = urlPath.split('/').map(encodeURIComponent).join('/').replace(/%2F/g, '/');
+        const source = urlPath.startsWith('/clips/') ? '클립'
+                     : urlPath.startsWith('/small/') ? '640'
+                     : '원본';
+        o.textContent = `${source} · ${urlPath.split('/').pop()}`;
+        sel.appendChild(o);
+      }
+    })
+    .catch(() => { /* 영상 폴더가 없으면 그만이다 */ });
+}
+
+/** `?report=N` 이면 N장 돌고 결과를 서버로 보낸다. 사람이 안 봐도 확인되게. */
+const reportAfter = Number(new URLSearchParams(location.search).get('report') ?? 0);
+const samples = [];
+/** 이번 실행에서 나온 트랙 번호 전부. 설정 차이는 여기서 드러난다. */
+const seenIds = new Set();
+let firstIdFrame = null;
+let frameNo = 0;
+/** 이어서 실패한 횟수. 한 장 미끄러진 것과 아주 망가진 것을 가른다. */
+let failStreak = 0;
+async function report() {
+  samples.sort((a, b) => a.total - b.total);
+  const mid = samples[samples.length >> 1];
+  const lines = [
+    `실시간 데모 ${samples.length}장`,
+    `프레임 중앙값 ${mid.total.toFixed(0)}ms (초당 ${(1000 / mid.total).toFixed(1)}장)`,
+    `  전처리 ${mid.pre.toFixed(0)} 추론 ${mid.inf.toFixed(0)} 후처리 ${mid.post.toFixed(0)} 추적·보정 ${mid.trk.toFixed(0)}`,
+    `탐지 ${mid.detections}개, ID 붙은 것 ${mid.withId}개, ${mid.w}x${mid.h}`,
+    // **트랙 번호가 몇 개나 났는지가 설정 차이를 드러낸다.** 한 프레임의 ID 개수만
+    // 보면 두 설정이 똑같아 보인다 - 쪼개짐은 여러 프레임에 걸쳐야 나타난다
+    `트랙 번호 ${seenIds.size}개 (적을수록 안 쪼개진 것), 첫 ID는 ${firstIdFrame ?? '-'}번째 장에서`,
+    `보정 ${gmcOn ? '켬' : '끔'}, 즉시ID ${instantId ? '켬' : '끔'}`,
+    // 세로 영상이 화면 안에 들어오는지 눈으로 안 보고 확인하려는 것이다
+    `화면 배치: 영상 ${video.clientWidth}x${video.clientHeight}` +
+      ` (원본 ${video.videoWidth}x${video.videoHeight}), 창 ${innerWidth}x${innerHeight}` +
+      `, 라벨 ${LABEL_PX}px 목표`,
+  ];
+  statsEl.textContent = lines.join('\n');
+  try { await fetch('/result', { method: 'POST', body: JSON.stringify({ lines: lines }) }); } catch {}
+}
+
+/**
+ * 탐지 루프.
+ *
+ * **화면 그리기와 분리돼 있다.** `<video>`는 브라우저가 알아서 부드럽게 재생하고,
+ * 여기서는 한 장 끝날 때마다 다음 장을 집는다 - 추론이 165ms라 초당 6장쯤 돈다.
+ * 박스는 그만큼 늦은 장면의 것이고, 그 지연을 아래 숫자로 보여준다.
+ */
+async function oneRound() {
+  if (!looping || !det) return;
+  // **아직 프레임이 없으면 기다렸다 다시 온다.** 여기서 그냥 return하면 예약이 끊겨
+  // 루프가 영영 멈춘다 - 첫 장만 그려지고 마는 것이 이것이었다
+  if (video.readyState < 2) { setTimeout(oneRound, 50); return; }
+  const t0 = performance.now();
+  try {
+    // **맞춤 모드면 지금 장면을 떠서 그것으로 탐지한다.** 탐지에 넣은 픽셀과 화면에
+    // 띄우는 픽셀이 같아야 박스가 정확히 맞는다 - `<video>`를 그대로 넣으면 탐지가
+    // 끝날 때쯤 영상은 이미 다음 장면이다
+    let inputFrame = video;
+    if (fitToBoxes) {
+      if (grabbed === null || grabbed.width !== video.videoWidth) {
+        grabbed = document.createElement('canvas');
+        grabbed.width = video.videoWidth;
+        grabbed.height = video.videoHeight;
+      }
+      grabbed.getContext('2d').drawImage(video, 0, 0);
+      inputFrame = grabbed;
+    }
+
+    const r = tracker.update(await det.detect(inputFrame), inputFrame);
+    const total = performance.now() - t0;
+
+    overlay.width = r.image.width;
+    overlay.height = r.image.height;
+    g.clearRect(0, 0, overlay.width, overlay.height);
+    // **박스에 맞춘 장면을 같이 그린다.** 안 그리면 `<video>`가 계속 흘러서, 165ms
+    // 걸린 추론의 박스가 그만큼 뒤늦은 장면 위에 얹힌다 - 한 박자 늦어 보이는 것이
+    // 그것이다. 그리면 딱 맞는 대신 화면이 초당 6장으로 끊긴다
+    if (fitToBoxes && grabbed) g.drawImage(grabbed, 0, 0, overlay.width, overlay.height);
+
+    /*
+     * **캔버스가 화면에서 늘어나거나 줄어드는 배율을 상쇄한다.**
+     *
+     * 캔버스는 CSS로 크기가 정해지므로 그 안에 그린 것이 통째로 확대·축소된다.
+     * 406픽셀짜리를 1200픽셀 폭에 띄우면 3배로 늘어나 글씨가 거대해지고, 1920짜리는
+     * 0.6배로 줄어 안 보인다. **화면에서 늘 같은 크기로 보이게 하려면 그린 크기를
+     * 배율로 나눠야 한다.**
+     */
+    const shown = overlay.clientWidth || overlay.width;
+    const zoom = shown / overlay.width;
+    const px = (screenPx) => Math.max(1, screenPx / zoom);
+    g.lineWidth = px(2.5);
+    const fontPx = px(LABEL_PX);
+    g.font = `${fontPx}px system-ui, sans-serif`;
+    r.detections.forEach((d, i) => {
+      const c = colorOf(d.track_id, d.class_id, i);
+      g.strokeStyle = c;
+      g.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+      // **앱과 같은 순서로 쓴다** - ID가 앞이다. 두 화면을 나란히 놓고 볼 때
+      // 같은 자리에 같은 것이 있어야 눈이 안 헷갈린다
+      const text = `${d.track_id !== null ? '#' + d.track_id + ' ' : ''}${d.class_name} ${d.confidence.toFixed(2)}`;
+      const pad = px(5);
+      const w = g.measureText(text).width + pad * 2;
+      const h = fontPx + pad * 1.6;
+      g.fillStyle = c;
+      g.fillRect(d.x1, Math.max(0, d.y1 - h), w, h);
+      g.fillStyle = '#000';
+      g.fillText(text, d.x1 + pad, Math.max(h - pad * 1.2, d.y1 - pad * 1.2));
+    });
+
+    frameNo++;
+    for (const d of r.detections) if (d.track_id !== null) {
+      seenIds.add(d.track_id);
+      if (firstIdFrame === null) firstIdFrame = frameNo;
+    }
+    const withId = r.detections.filter(d => d.track_id !== null).length;
+    statsEl.textContent =
+      `프레임 ${total.toFixed(0)}ms · 초당 ${(1000 / total).toFixed(1)}장   ` +
+      `= (전처리 ${r.speed.preprocess.toFixed(0)} + 추론 ${r.speed.inference.toFixed(0)}` +
+      ` + 후처리 ${r.speed.postprocess.toFixed(0)} + 추적·보정 ${(total - r.speed.preprocess - r.speed.inference - r.speed.postprocess).toFixed(0)})\n` +
+      `탐지 ${r.detections.length}개 · ID 붙은 것 ${withId}개 · ${r.image.width}x${r.image.height}`;
+    // **이 블록은 `try` 안에 있어야 한다.** `total`·`r`·`withId`가 여기서 선언되므로
+    // 밖으로 빼면 매 프레임 `ReferenceError`가 나고, 그러면 아래 예약이 안 걸려
+    // 루프가 첫 장에서 멈춘다
+    if (reportAfter > 0) {
+      samples.push({ total, pre: r.speed.preprocess, inf: r.speed.inference, post: r.speed.postprocess,
+                     trk: total - r.speed.preprocess - r.speed.inference - r.speed.postprocess,
+                     detections: r.detections.length, withId, w: r.image.width, h: r.image.height });
+      // 앞 3장은 버린다 - 첫 추론에 WASM 예열이 섞인다
+      if (samples.length === reportAfter + 3) { samples.splice(0, 3); looping = false; await report(); return; }
+    }
+    failStreak = 0;
+  } catch (e) {
+    // **한 장 실패했다고 루프를 죽이면 안 된다.** 전에는 여기서 멈춰버려서, 한 번
+    // 미끄러지면 화면이 그대로 굳었다 - 사람이 보기엔 "탐지되다 만다"가 된다.
+    // 이어서 실패할 때만 포기한다
+    failStreak++;
+    statusEl.textContent = `한 장 건너뜀 (${failStreak}번째): ${e?.message ?? e}`;
+    if (failStreak >= 10) {
+      statusEl.textContent = `10장 이어서 실패해 멈춥니다: ${e?.message ?? e}`;
+      looping = false;
+      return;
+    }
+    setTimeout(oneRound, 100);
+    return;
+  }
+
+  // **다음 장은 다음 틱에.** 곧바로 부르면 화면 갱신이 밀린다
+  setTimeout(oneRound, 0);
+}
+
+/**
+ * **10초 안에 한 장도 못 돌면 왜인지 보고한다.**
+ *
+ * 화면만 멈춰 있으면 모델이 문제인지 영상이 문제인지 알 수 없다. 실제로 그래서
+ * 한참 헤맸다.
+ */
+function watchdog() {
+  setTimeout(async () => {
+    if (samples.length > 0 || statsEl.textContent) return;
+    const e = video.error;
+    const lines = [
+      '10초 동안 한 장도 못 돌았다',
+      `영상: readyState=${video.readyState} networkState=${video.networkState}` +
+        ` paused=${video.paused} 크기=${video.videoWidth}x${video.videoHeight}`,
+      `src=${video.currentSrc || '(없음)'}`,
+      `error=${e ? `code ${e.code} ${e.message}` : '없음'}`,
+      `모델=${det ? '열림' : '안 열림'} 돈다=${looping}`,
+    ];
+    statsEl.textContent = lines.join('\n');
+    try { await fetch('/result', { method: 'POST', body: JSON.stringify({ lines: lines }) }); } catch {}
+  }, 10000);
+}
+
+function play(src, webcamStream) {
+  watchdog();
+  looping = false;
+  newTracker();
+  if (webcamStream) video.srcObject = webcamStream;
+  else { video.srcObject = null; video.src = src; }
+  video.play().then(() => { looping = true; oneRound(); }).catch(e => {
+    // **브라우저는 사람이 누르기 전에는 재생을 막는다.** 주소로 바로 트는 길
+    // (`?video=`)이 배포된 페이지에서 걸리는 자리다 - 무엇을 하라는 것인지 적어준다
+    statusEl.textContent = `재생하려면 화면을 한 번 누르세요 (${e?.name ?? '재생 막힘'})`;
+    const onClick = () => {
+      document.removeEventListener('click', onClick);
+      video.play().then(() => {
+        statusEl.textContent = '도는 중';
+        looping = true;
+        oneRound();
+      }).catch((e2) => { statusEl.textContent = '재생 실패: ' + (e2?.message ?? e2); });
+    };
+    document.addEventListener('click', onClick);
+  });
+}
+
+document.getElementById('webcam').onclick = async () => {
+  const [w, h] = document.getElementById('resolution').value.split('x').map(Number);
+  // **`ideal`이지 `exact`가 아니다.** 카메라가 그 크기를 못 내면 가까운 것을 준다 -
+  // `exact`로 조르면 아예 안 열린다. 실제로 받은 크기는 아래 숫자에 뜬다
+  const constraints = w > 0
+    ? { width: { ideal: w }, height: { ideal: h } }
+    : { width: { ideal: 4096 }, height: { ideal: 2160 } };
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: constraints, audio: false });
+    play(null, s);
+  } catch (e) {
+    statusEl.textContent = '웹캠 실패: ' + (e?.message ?? e);
+  }
+};
+
+const fitBox = document.getElementById('fit');
+fitBox.onchange = () => {
+  fitToBoxes = fitBox.checked;
+  // 맞춤이면 캔버스가 장면까지 그리므로 영상 자체는 숨긴다. 안 숨기면 두 장이 겹친다
+  video.style.visibility = fitToBoxes ? 'hidden' : 'visible';
+};
+document.getElementById('video-pick').onchange = (e) => { if (e.target.value) play(e.target.value); };
+document.getElementById('file-btn').onclick = () => document.getElementById('file').click();
+document.getElementById('file').onchange = (e) => {
+  const f = e.target.files?.[0];
+  if (f) play(URL.createObjectURL(f));
+};
+
+/**
+ * 번호를 1번부터 다시 센다.
+ *
+ * **추적기를 새로 만드는 것이 아니라 `reset()`을 부른다** - 새로 만들면 흔들림 보정도
+ * 같이 초기화돼 이전 프레임을 잃는다. `reset()`은 트랙만 버린다.
+ */
+document.getElementById('reset').onclick = () => {
+  tracker?.reset();
+  seenIds.clear();
+  firstIdFrame = null;
+  frameNo = 0;
+  statusEl.textContent = '추적 ID를 초기화했습니다';
+};
+
+const gmcBox = document.getElementById('gmc');
+gmcBox.onchange = () => {
+  gmcOn = gmcBox.checked;
+  newTracker();   // 보정 상태가 트랙에 남아 있어 갈아끼우면 안 된다
+};
+const instantBox = document.getElementById('instant');
+instantBox.onchange = () => {
+  instantId = instantBox.checked;
+  newTracker();
+};
+
+/**
+ * **화면의 체크 상태를 진짜 값으로 삼는다.**
+ *
+ * 자바스크립트 변수와 HTML의 `checked`를 따로 적어두면 어긋난다 - 실제로 "화면에는
+ * 끔이라고 뜨는데 그렇게 안 돈다"는 말을 들었다. 시작할 때 한 번 맞춘다.
+ *
+ * 주소로도 정할 수 있다: `?fit=1&gmc=0&instant=1`
+ */
+function readSettings() {
+  const q = new URLSearchParams(location.search);
+  for (const [param, box] of [['fit', fitBox], ['gmc', gmcBox], ['instant', instantBox]]) {
+    const v = q.get(param);
+    if (v !== null) box.checked = v !== '0' && v !== 'false';
+  }
+  fitToBoxes = fitBox.checked;
+  gmcOn = gmcBox.checked;
+  instantId = instantBox.checked;
+  video.style.visibility = fitToBoxes ? 'hidden' : 'visible';
+}
+
+start().catch(e => { statusEl.textContent = '모델 실패: ' + (e?.message ?? e); });
+</script>

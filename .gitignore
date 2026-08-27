@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+out/
+demo/node_modules/
+# 데모 영상은 각자 넣는다. 만드는 법은 demo/server.mjs 주석에 있다
+demo/clips/*
+
+# 모델은 저장소에 안 넣는다 (허깅페이스에서 받는다). 테스트는 여기 있으면 돈다.
+model.onnx
+*.tgz
+
+# 파이썬 스크립트는 이 저장소에 안 넣는다
+*.py

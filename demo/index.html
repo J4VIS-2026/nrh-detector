@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>nrh-detector 웹 데모</title>
+<style>
+  body { font: 14px/1.6 system-ui, sans-serif; margin: 0; padding: 16px;
+         background: #12141a; color: #e8ecf4; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meh { color: #9fb0c8; font-size: 12px; }
+  table { border-collapse: collapse; margin: 12px 0; font-size: 13px; }
+  th, td { border: 1px solid #2a2f3a; padding: 5px 10px; text-align: left; }
+  th { background: #1b1f28; }
+  .good { color: #4ade80; } .bad { color: #f87171; } .보통 { color: #fbbf24; }
+  #board { position: relative; display: inline-block; margin-top: 12px; }
+  #board canvas { max-width: 100%; border: 1px solid #2a2f3a; }
+  pre { background: #1b1f28; padding: 10px; border-radius: 6px; overflow-x: auto;
+        font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>nrh-detector 웹 데모</h1>
+<div class="meh">브라우저에서 실제로 도는지, 얼마나 빠른지, 기준값과 답이 같은지 봅니다.</div>
+<div id="status">시작하는 중...</div>
+<div id="result"></div>
+<div id="board"><canvas id="shot"></canvas></div>
+
+<script type="importmap">
+{ "imports": { "onnxruntime-web": "/ort/ort.all.bundle.min.mjs" } }
+</script>
+
+<script type="module">
+// **여기가 확인하려는 것 전부다.**
+//
+// 1. 실제 브라우저에서 도나 - 지금까지 노드로만 돌렸다
+// 2. 얼마나 빠른가, 그리고 **스레드와 WebGPU가 얼마나 바꾸나**
+// 3. 기준값과 답이 같은가 - canvas 축소가 opencv와 달라 몇 개는 갈릴 수 있다
+//
+// 결과는 서버로 보낸다. 사람이 콘솔을 들여다볼 필요가 없게 하려는 것이다.
+
+import * as ort from 'onnxruntime-web';
+import { Detector } from '/dist/web/index.js';
+import { Tracker } from '/dist/core/tracker.js';
+import { createGmc } from '/dist/web/gmc.js';
+
+const lines = [];
+const statusEl = document.getElementById('status');
+const resultBox = document.getElementById('result');
+
+function log2(s) {
+  lines.push(s);
+  statusEl.textContent = s;
+  console.log(s);
+}
+
+/**
+ * 지금까지 알아낸 것을 서버로 보낸다.
+ *
+ * **한 설정이 멈춰도 앞의 결과는 건진다.** 끝에 한 번만 보냈더니 webgpu에서 멎었을 때
+ * wasm 숫자까지 통째로 날아갔다.
+ */
+async function send() {
+  try {
+    await fetch('/result', { method: 'POST', body: JSON.stringify({ lines: lines }) });
+  } catch {}
+}
+
+/** 오래 걸리면 포기한다. 헤드리스에서 webgpu가 응답을 안 하는 일이 있다. */
+function withTimeout(promise, ms, name) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${name}: ${ms}ms 안에 안 끝남`)), ms)),
+  ]);
+}
+
+function table(title, rows) {
+  const t = document.createElement('table');
+  t.innerHTML = `<caption style="text-align:left;font-weight:700;padding:6px 0">${title}</caption>`
+    + rows.map(r => `<tr>${r.map((c, i) =>
+        i === 0 ? `<th>${c}</th>` : `<td>${c}</td>`).join('')}</tr>`).join('');
+  resultBox.appendChild(t);
+}
+
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; };
+
+async function run() {
+  // ── 환경 ────────────────────────────────────────────────────────────────
+  const isolated = self.crossOriginIsolated;
+  log2(`브라우저: ${navigator.userAgent.split(') ').pop()}`);
+  lines.push(
+    `crossOriginIsolated=${isolated}  SharedArrayBuffer=${typeof SharedArrayBuffer}  ` +
+    `하드웨어 스레드=${navigator.hardwareConcurrency}  WebGPU=${'gpu' in navigator}`,
+  );
+  table('환경', [
+    ['교차 출처 격리', isolated ? '<span class="good">켜짐 - 멀티스레드 가능</span>'
+                             : '<span class="bad">꺼짐 - 1스레드로 떨어짐</span>'],
+    ['SharedArrayBuffer', typeof SharedArrayBuffer],
+    ['하드웨어 스레드', navigator.hardwareConcurrency],
+    ['WebGPU', 'gpu' in navigator ? '<span class="good">있음</span>' : '<span class="bad">없음</span>'],
+  ]);
+
+  // ── 그림 ────────────────────────────────────────────────────────────────
+  const img = new Image();
+  img.src = '/samples/street.jpg';
+  await img.decode();
+  lines.push(`사진 ${img.naturalWidth}x${img.naturalHeight}`);
+
+  const MODEL = '/model.onnx';
+  const samples = [];
+  let lastResult = null;
+  /**
+   * 대조와 그리기에 쓸 **믿을 만한** 결과.
+   *
+   * webgpu가 예외 없이 7999개짜리 쓰레기를 냈다. 마지막 결과를 그냥 쓰면 그것으로
+   * 대조하게 되어 "기준값과 0개 일치"라는 엉뚱한 결론이 나온다.
+   */
+  let sane = null;
+
+  // ── 설정별로 돌린다 ─────────────────────────────────────────────────────
+  const configs = [
+    { name: 'wasm 1스레드', ep: ['wasm'], threads: 1 },
+    { name: `wasm ${Math.min(4, navigator.hardwareConcurrency)}스레드`,
+      ep: ['wasm'], threads: Math.min(4, navigator.hardwareConcurrency) },
+    { name: 'webgpu', ep: ['webgpu'], threads: 1 },
+  ];
+
+  for (const cfg of configs) {
+    log2(`${cfg.name} 재는 중...`);
+    try {
+      // **스레드 수는 세션을 만들기 전에 정해야 한다.** 만든 뒤에 바꾸면 안 먹는다
+      ort.env.wasm.numThreads = isolated ? cfg.threads : 1;
+      ort.env.wasm.simd = true;
+
+      const t0 = performance.now();
+      const det = await withTimeout(
+        Detector.open({ modelUrl: MODEL, executionProviders: cfg.ep }), 60000, '세션 만들기');
+      const loadMs = performance.now() - t0;
+
+      // 두 번은 버린다 - 첫 추론에 커널 준비가 섞인다
+      await withTimeout(det.detect(img), 60000, '첫 추론');
+      await det.detect(img);
+
+      const pre = [], inf = [], post = [];
+      for (let i = 0; i < 10; i++) {
+        const r = await det.detect(img);
+        pre.push(r.speed.preprocess); inf.push(r.speed.inference); post.push(r.speed.postprocess);
+        lastResult = r;
+      }
+      const sum = median(pre) + median(inf) + median(post);
+      // **터무니없는 개수는 쓰레기다.** 640x640에 앵커가 8400개인데 그만큼 나왔다는 것은
+      // 출력 텐서를 잘못 읽고 있다는 뜻이다. 예외가 안 나므로 여기서 걸러야 한다
+      const isSane = lastResult.detections.length <= 300;
+      if (isSane && !sane) sane = lastResult;
+      samples.push({
+        isSane,
+        name: cfg.name, loadMs: Math.round(loadMs), pre: median(pre), inf: median(inf),
+        post: median(post), sum, detections: lastResult.detections.length,
+      });
+      await det.close();
+    } catch (e) {
+      samples.push({ name: cfg.name, failed: String(e?.message ?? e) });
+    }
+    // 한 설정이 끝날 때마다 보낸다 - 뒤에서 멎어도 앞의 것은 남는다
+    const now = samples[samples.length - 1];
+    lines.push(now.failed
+      ? `${now.name}: 실패 ${now.failed}`
+      : `${now.name}: ${now.isSane ? '' : '[출력이 쓰레기다] '}로딩 ${now.loadMs}ms  전처리 ${now.pre.toFixed(0)}  ` +
+        `추론 ${now.inf.toFixed(0)}  후처리 ${now.post.toFixed(0)}  ` +
+        `합계 ${now.sum.toFixed(0)}ms (초당 ${(1000 / now.sum).toFixed(1)}장)  탐지 ${now.detections}개`);
+    await send();
+  }
+
+  table('속도 (같은 사진 10번, 중앙값 ms)',
+    [['설정', '로딩', '전처리', '추론', '후처리', '합계', '초당', '탐지']].concat(
+      samples.map(m => m.failed
+        ? [m.name, `<span class="bad" colspan=7>${m.failed}</span>`, '', '', '', '', '', '']
+        : [m.name, m.loadMs, m.pre.toFixed(0), `<b>${m.inf.toFixed(0)}</b>`, m.post.toFixed(0),
+           `<b>${m.sum.toFixed(0)}</b>`, (1000 / m.sum).toFixed(1),
+           m.isSane ? m.detections : `<span class="bad">${m.detections} (쓰레기)</span>`])));
+
+  /*
+   * **기준값과의 대조는 여기서 안 한다.** `npm test` 가 고정된 입력과 기준값으로
+   * 견주는데, 이 페이지는 사진 한 장을 브라우저에서 돌리는 것이라 canvas 축소가
+   * 섞여 두 가지가 갈릴 때 무엇이 원인인지 못 가린다.
+   */
+  if (sane) {
+    const keyOf = d => `${d.class_name} ${d.x1},${d.y1},${d.x2},${d.y2}`;
+    lines.push('탐지: ' + sane.detections.slice(0, 12).map(keyOf).join(' | '));
+
+    // ── 추적이 도나 ───────────────────────────────────────────────────────
+    try {
+      const T = new Tracker({ confirm_immediately: true });
+      const r = T.update(sane);
+      const withId = r.detections.filter(d => d.track_id !== null).length;
+      lines.push(`추적: ${withId}/${r.detections.length}개에 ID, settings.track=${r.settings.track}`);
+      table('추적', [['ID 붙은 탐지', `${withId} / ${r.detections.length}`],
+                 ['settings.track', String(r.settings.track)]]);
+    } catch (e) {
+      lines.push(`추적 실패: ${e?.message ?? e}`);
+    }
+
+    // ── 흔들림 보정 ───────────────────────────────────────────────────────
+    // **정답을 아는 시험으로 잰다.** 같은 그림을 정해둔 만큼 밀어 두 번째 프레임을
+    // 만들었으니 보정이 그 값을 되찾아야 한다. 시간만 재면 죽은 줄 모르고 넘어간다
+    try {
+      const TW = 1280, TH = 720, DX = 12, DY = -7;
+      const makeCanvas = (dx, dy) => {
+        const k = document.createElement('canvas');
+        k.width = TW; k.height = TH;
+        k.getContext('2d').drawImage(img, dx, dy, TW, TH);
+        return k;
+      };
+      const A = makeCanvas(0, 0), B = makeCanvas(DX, DY);
+
+      const warm = createGmc();
+      warm(A); warm(B);
+
+      const samples = [];
+      let w = null;
+      for (let i = 0; i < 7; i++) {
+        const g2 = createGmc();
+        g2(A);
+        const t = performance.now();
+        w = g2(B);
+        samples.push(performance.now() - t);
+      }
+      samples.sort((x, y) => x - y);
+      const median = samples[3];
+      const err = Math.hypot(w[2] - DX, w[5] - DY);
+      const recovered = '(' + w[2].toFixed(2) + ', ' + w[5].toFixed(2) + ')';
+      lines.push('흔들림 보정 ' + TW + 'x' + TH + ': ' + median.toFixed(1) + 'ms, 되찾은 이동 '
+        + recovered + ' 정답 (' + DX + ', ' + DY + ') 오차 ' + err.toFixed(2) + 'px');
+      table('흔들림 보정 (1280x720, 1/4 축소)', [
+        ['한 프레임', median.toFixed(1) + 'ms'],
+        ['되찾은 평행이동', recovered],
+        ['정답', '(' + DX + ', ' + DY + ')'],
+        ['오차', err.toFixed(2) + 'px'],
+      ]);
+    } catch (e) {
+      lines.push('흔들림 보정 실패: ' + (e && e.message ? e.message : e));
+    }
+
+    // ── 눈으로 볼 것 ──────────────────────────────────────────────────────
+    const c = document.getElementById('shot');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const g = c.getContext('2d');
+    g.drawImage(img, 0, 0);
+    g.lineWidth = 4; g.font = '20px sans-serif';
+    sane.detections.forEach((d, i) => {
+      g.strokeStyle = `hsl(${(i * 47) % 360},85%,60%)`;
+      g.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+      g.fillStyle = g.strokeStyle;
+      g.fillRect(d.x1, Math.max(0, d.y1 - 22), 210, 22);
+      g.fillStyle = '#000';
+      g.fillText(`${d.class_name} ${d.confidence.toFixed(2)}`, d.x1 + 4, Math.max(16, d.y1 - 5));
+    });
+  }
+
+  // **그림도 보낸다.** 헤드리스 스크린샷은 페이지가 끝나기 전에 찍혀서 빈 화면만
+  // 나온다. 다 그린 뒤에 캔버스를 직접 보내면 그럴 일이 없다
+  try {
+    const c = document.getElementById('shot');
+    if (c.width > 0) {
+      await fetch('/image', { method: 'POST', body: c.toDataURL('image/png') });
+    }
+  } catch (e) {
+    lines.push(`그림 보내기 실패: ${e?.message ?? e}`);
+  }
+
+  log2('끝');
+  await send();
+}
+
+run().catch(async e => {
+  log2(`통째로 실패: ${e?.stack ?? e}`);
+  await send();
+});
+</script>
+</body>
+</html>

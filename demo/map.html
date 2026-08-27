@@ -1,0 +1,109 @@
+<meta charset="utf-8">
+<title>브라우저 mAP 재기</title>
+<style>
+  body { font: 14px/1.6 system-ui, sans-serif; margin: 2rem; max-width: 50rem; }
+  #progress { font-variant-numeric: tabular-nums; }
+  pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
+</style>
+
+<h1>브라우저 mAP 재기</h1>
+<p>
+  <b>이 페이지는 개발용입니다.</b> 검증셋 이미지와 이미지 목록 파일, 그리고 채점기가
+  따로 있어야 돌아갑니다 — 학습 데이터는 이용 조건상 배포할 수 없어 이 저장소에 없습니다.
+  <br><br>
+  브라우저에서 뽑은 탐지를 기준 구현과 <b>같은 채점기</b>로 매기는 것이 이 도구의 목적입니다.
+  채점기를 따로 짜면 숫자가 달라져도 구현 차이인지 채점 차이인지 못 가립니다.
+  <br><br>
+  쓰시려면 <code>NRH_VAL_IMAGES</code> 와 <code>NRH_VAL_LIST</code> 를 지정하고 서버를 켜세요.
+</p>
+<p id="progress">준비 중...</p>
+<pre id="log"></pre>
+
+<script type="importmap">
+{ "imports": { "onnxruntime-web": "/ort/ort.all.bundle.min.mjs" } }
+</script>
+<script type="module">
+import { Detector } from '/dist/web/index.js';
+
+const progress = document.getElementById('progress');
+const text = document.getElementById('log');
+const log = (s) => { text.textContent += s + '\n'; };
+
+/** 이미지 하나를 그릴 수 있는 것으로. */
+function loadImage(url) {
+  return new Promise((resolve, reject2) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject2(new Error('못 읽음: ' + url));
+    img.src = url;
+  });
+}
+
+async function run() {
+  const howMany = Number(new URLSearchParams(location.search).get('n') ?? 500);
+  const list = await (await fetch('/vallist?n=' + howMany)).json();
+  log(`이미지 ${list.length}장`);
+
+  // **conf를 0.001로 낮춘다.** mAP는 PR 곡선의 꼬리까지 봐야 한다 - 기준값을 잴 때도
+  // 같은 값을 쓴다. 기본값 0.25로 재면 재현율 쪽이 통째로 잘려 숫자가 안 맞는다
+  const MODEL = '/model.onnx';
+  const det = await Detector.open({ modelUrl: MODEL, conf: 0.001 });
+  const classNames = {};
+  for (const [k, v] of det.classNames) classNames[k] = v;
+  log(`클래스 ${Object.keys(classNames).length}개, conf 0.001`);
+
+  const images = {};
+  let detTotal = 0;
+  const start = performance.now();
+  let inferSum = 0;
+
+  for (let i = 0; i < list.length; i++) {
+    const urlPath = list[i];
+    let img;
+    try {
+      img = await loadImage('/val/' + urlPath.split('/').map(encodeURIComponent).join('/'));
+    } catch (e) {
+      log('건너뜀 ' + urlPath);
+      continue;
+    }
+    const r = await det.detect(img);
+    inferSum += r.speed.inference;
+    detTotal += r.detections.length;
+    images[urlPath] = {
+      width: r.image.width,
+      height: r.image.height,
+      detections: r.detections.map((d) => ({
+        x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2,
+        confidence: d.confidence, class_id: d.class_id,
+      })),
+    };
+    if ((i + 1) % 10 === 0 || i === list.length - 1) {
+      const sinceStart = (performance.now() - start) / 1000;
+      progress.textContent =
+        `${i + 1}/${list.length}장  ${sinceStart.toFixed(0)}초 지남  ` +
+        `남은 시간 약 ${((sinceStart / (i + 1)) * (list.length - i - 1)).toFixed(0)}초  ` +
+        `탐지 ${detTotal}개`;
+      await new Promise((r) => setTimeout(r, 0));   // 화면이 갱신되게 한 박자 준다
+    }
+  }
+
+  const elapsed = (performance.now() - start) / 1000;
+  const frames = Object.keys(images).length;
+  log(`끝. ${frames}장, ${elapsed.toFixed(0)}초, 한 장 ${(elapsed * 1000 / frames).toFixed(0)}ms`);
+  log(`추론만 평균 ${(inferSum / frames).toFixed(1)}ms`);
+  log(`탐지 ${detTotal}개 (장당 ${(detTotal / frames).toFixed(1)}개)`);
+  log(`축소 방식: canvas`);
+
+  await fetch('/detections', {
+    method: 'POST',
+    body: JSON.stringify({ classNames, resize: 'canvas', conf: 0.001, images }),
+  });
+  log('보냈다 → out/web-detections.json');
+  progress.textContent = '끝났다';
+}
+
+run().catch((e) => {
+  progress.textContent = '실패';
+  log('실패: ' + (e && e.stack ? e.stack : e));
+});
+</script>
